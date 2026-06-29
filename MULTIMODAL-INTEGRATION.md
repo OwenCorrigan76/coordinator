@@ -1,32 +1,55 @@
-# Multimodal Endpoint Integration Guide
+# Multimodal & Disaggregated LLM Integration Guide
 
-This document describes how we integrated multimodal endpoints (TTS, STT, image generation) with the llm-d Coordinator for routing through EPP (Endpoint Picker).
+This document describes the coordinator integration with llm-d's EPP (Endpoint Picker) for both multimodal routing and disaggregated LLM inference.
 
 ## Overview
 
-The Coordinator now supports routing multimodal inference requests (`/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/images/generations`) through a simple gateway-proxy pipeline step. These requests are forwarded to an Envoy Gateway, which uses EPP's modality filter to route to the correct backend pods based on `llm-d.ai/model-arch` labels.
+The Coordinator supports two types of inference workflows:
+
+1. **Multimodal endpoints** (`/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/images/generations`) - Simple pass-through via `gateway-proxy` step
+2. **Disaggregated LLM** (`/v1/chat/completions`, `/v1/completions`) - Full pipeline orchestration via `encode → prefill → decode` steps
+
+Both workflows route through Envoy Gateway and EPP for intelligent pod selection.
 
 ## Architecture
 
+### Multimodal Flow (Simple)
 ```
 Client
-  ↓
+  ↓ /v1/audio/speech
 Coordinator (port 8080)
   ↓ gateway-proxy step
 Envoy Gateway (inference-gateway-istio)
   ↓ ext-proc gRPC
 EPP (modality filter)
   ↓ routes based on path + llm-d.ai/model-arch label
-Backend Pods (TTS/STT/Image/LLM)
+TTS Backend Pod (llm-d.ai/model-arch: autoregressive-tts)
 ```
 
-## Changes Made
+### Disaggregated LLM Flow (Complex)
+```
+Client
+  ↓ /v1/chat/completions
+Coordinator (port 8080)
+  ↓ encode step (sets EPP-Phase: encode)
+Envoy → EPP → Encode Pod (llm-d.ai/role: encode)
+  ↓
+  ↓ prefill step (sets EPP-Phase: prefill)
+Envoy → EPP → Prefill Pod (llm-d.ai/role: prefill)
+  ↓
+  ↓ decode step (sets EPP-Phase: decode)
+Envoy → EPP → Decode Pod (llm-d.ai/role: decode)
+  ↓
+Client (streaming response)
+```
+
+## Changes Made to Coordinator
 
 ### 1. Added Gateway-Proxy Step
 
 **File:** `pkg/steps/gateway_proxy.go`
 
-A new pipeline step that forwards requests to the Envoy Gateway without modification. This is simpler than the full LLM disaggregation pipeline and is suitable for endpoints that don't need encode/prefill/decode orchestration.
+A new pipeline step that forwards requests to Envoy Gateway without modification. Used for multimodal endpoints that don't need disaggregation.
 
 ```go
 package steps
@@ -133,160 +156,99 @@ r.Get("/healthz", s.handleHealth)
 r.Get("/readyz", s.handleHealth)
 ```
 
-## Building and Deploying
+### 4. Existing Pipeline Steps
 
-### Prerequisites
+The coordinator already had disaggregation steps that set EPP-Phase headers:
 
-- Docker Desktop running
-- Access to a Kubernetes cluster with:
-  - Envoy Gateway (e.g., `inference-gateway-istio`)
-  - EPP deployment with modality filter enabled
-  - Backend pods labeled with `llm-d.ai/model-arch`
+- **encode.go** (line 115): `headers[gateway.EPPPhaseHeader] = gateway.PhaseEncode`
+- **prefill.go** (line 92): `headers[gateway.EPPPhaseHeader] = gateway.PhasePrefill`
+- **decode.go**: `headers[gateway.EPPPhaseHeader] = gateway.PhaseDecode`
 
-### Build Coordinator Image
+## Backend Pod Configuration
 
-```bash
-# Build for arm64 (Mac M1/M2)
-TARGETARCH=arm64 make image-build-coordinator
+### Disaggregated LLM Pods
 
-# For amd64 (Intel)
-TARGETARCH=amd64 make image-build-coordinator
+Created three separate pod deployments with `llm-d.ai/role` labels for phase-based routing:
 
-# Verify image was built
-docker images | grep coordinator
-```
-
-### Load into Kind Cluster (if using kind)
-
-```bash
-kind --name <cluster-name> load docker-image ghcr.io/llm-d/llm-d-coordinator:dev
-```
-
-### Deploy to Kubernetes
-
-**Configuration:** `configs/coordinator-multimodal.yaml`
+**File:** `disaggregated-llm-pods.yaml`
 
 ```yaml
-log_level: 2
+---
+# Encode Pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-encode-vllm-sim
+spec:
+  template:
+    metadata:
+      labels:
+        app: food-review-inference-pool
+        llm-d.ai/inferenceServing: "true"
+        llm-d.ai/model-arch: autoregressive-llm
+        llm-d.ai/role: encode  # Phase label
+    spec:
+      containers:
+      - name: routing-sidecar
+        image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev
+        args: ["--port=8000", "--vllm-port=8200", ...]
+        ports:
+        - containerPort: 8000
+      - name: vllm
+        image: ghcr.io/llm-d/llm-d-inference-sim:latest
+        args: ["--port=8200", "--model=llama-3-encode", ...]
+        ports:
+        - containerPort: 8200
 
-server:
-  listen_addr: ":8080"
-  read_timeout: 30s
-  write_timeout: 120s
-  shutdown_timeout: 25s
+---
+# Prefill Pod (similar structure with llm-d.ai/role: prefill)
+---
+# Decode Pod (similar structure with llm-d.ai/role: decode)
+```
 
-gateway:
-  # IMPORTANT: Point to Envoy Gateway, not EPP directly
-  address: "http://inference-gateway-istio.default.svc.cluster.local"
-  max_idle_conns_per_host: 100
-  idle_conn_timeout: 90s
-  timeout: 60s
+**Key points:**
+- Each pod has TWO containers: routing-sidecar (port 8000) + vllm sim (port 8200)
+- `app: food-review-inference-pool` label for EPP discovery
+- `llm-d.ai/role` label: `encode`, `prefill`, or `decode`
+- `llm-d.ai/model-arch: autoregressive-llm` for modality filtering
 
+## Pipeline Configurations
+
+### Multimodal Pipeline (gateway-proxy)
+
+```yaml
+# configs/coordinator-multimodal.yaml
 pipeline:
   kv_connector: kv-shared-storage
   ec_connector: ec-shared-storage
   use_openai_format: true
-
+  
   steps:
     - type: gateway-proxy
       params: {}
 ```
 
-**Kubernetes Deployment:**
+### Disaggregated LLM Pipeline (encode → prefill → decode)
 
 ```yaml
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: coordinator-config
-  namespace: default
-data:
-  coordinator.yaml: |
-    log_level: 2
-    server:
-      listen_addr: ":8080"
-      read_timeout: 30s
-      write_timeout: 120s
-      shutdown_timeout: 25s
-    gateway:
-      address: "http://inference-gateway-istio.default.svc.cluster.local"
-      max_idle_conns_per_host: 100
-      idle_conn_timeout: 90s
-      timeout: 60s
-    pipeline:
-      kv_connector: kv-shared-storage
-      ec_connector: ec-shared-storage
-      use_openai_format: true
-      steps:
-        - type: gateway-proxy
-          params: {}
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: coordinator
-  namespace: default
-  labels:
-    app: coordinator
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: coordinator
-  template:
-    metadata:
-      labels:
-        app: coordinator
-    spec:
-      containers:
-      - name: coordinator
-        image: ghcr.io/llm-d/llm-d-coordinator:dev
-        imagePullPolicy: IfNotPresent
-        args:
-        - --config=/etc/coordinator/coordinator.yaml
-        ports:
-        - containerPort: 8080
-          name: http
-          protocol: TCP
-        volumeMounts:
-        - name: config
-          mountPath: /etc/coordinator
-          readOnly: true
-      volumes:
-      - name: config
-        configMap:
-          name: coordinator-config
-
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: coordinator
-  namespace: default
-spec:
-  selector:
-    app: coordinator
-  ports:
-  - port: 80
-    targetPort: 8080
-    protocol: TCP
-    name: http
-  type: ClusterIP
-```
-
-**Deploy:**
-
-```bash
-kubectl apply -f deploy/coordinator-multimodal.yaml
-kubectl rollout status deployment/coordinator --timeout=60s
-kubectl get pods -l app=coordinator
+# configs/coordinator-disaggregated.yaml
+pipeline:
+  kv_connector: kv-shared-storage
+  ec_connector: ec-shared-storage
+  use_openai_format: true
+  
+  steps:
+    - type: encode
+      params: {}
+    - type: prefill
+      params: {}
+    - type: decode
+      params: {}
 ```
 
 ## Testing
 
-### Test TTS Endpoint
+### Test Multimodal Routing
 
 ```bash
 # Port-forward to coordinator
@@ -298,126 +260,116 @@ curl -X POST http://localhost:8080/v1/audio/speech \
   -d '{"model":"tts-1","input":"hello world"}'
 ```
 
-### Test STT Endpoint
+**Expected flow:**
+1. Coordinator receives request on `/v1/audio/speech`
+2. Gateway-proxy step forwards to Envoy
+3. EPP modality-filter sees path `/v1/audio/speech`
+4. Filters to pod with `llm-d.ai/model-arch: autoregressive-tts`
+5. Routes to TTS backend pod
 
+**Check coordinator logs:**
 ```bash
-curl -X POST http://localhost:8080/v1/audio/transcriptions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"whisper-1","file":"test.wav"}'
-```
-
-### Test Image Generation Endpoint
-
-```bash
-curl -X POST http://localhost:8080/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"dall-e-3","prompt":"a test image"}'
-```
-
-### Verify Routing
-
-Check that requests flow through the full stack:
-
-```bash
-# Check coordinator logs
 kubectl logs deployment/coordinator --tail=20
+```
+Expected: `{"msg":"proxying request","path":"/v1/audio/speech"}`
 
-# Check EPP logs (if accessible)
+**Check EPP logs:**
+```bash
 kubectl logs deployment/<epp-deployment> -c epp --tail=50 | grep "modality-filter"
 ```
+Expected: Pod filtered to `autoregressive-tts` architecture
 
-**Expected coordinator logs:**
-```json
-{"msg":"received request","path":"/v1/audio/speech","model":"tts-1"}
-{"msg":"proxying request","path":"/v1/audio/speech","stream":false}
+### Test Disaggregated LLM
+
+```bash
+# Test LLM endpoint with disaggregated pipeline
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama-3-prefill","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-**Expected EPP logs:**
+**Expected flow:**
+1. Coordinator receives `/v1/chat/completions`
+2. Encode step skipped (no multimodal content)
+3. Prefill step sets `EPP-Phase: prefill` header
+4. EPP routes to pod with `llm-d.ai/role: prefill`
+5. Decode step sets `EPP-Phase: decode` header  
+6. EPP routes to pod with `llm-d.ai/role: decode`
+
+**Check coordinator logs:**
+```bash
+kubectl logs deployment/coordinator --tail=30
+```
+Expected:
 ```json
-{"msg":"Running filter plugin","plugin":"modality-filter/modality-filter"}
-{"msg":"Completed running filter plugin successfully","endpoints":[{"PodName":"tts-vllm-sim-...","llm-d.ai/model-arch":"autoregressive-tts"}]}
+{"msg":"received request","path":"/v1/chat/completions"}
+{"msg":"sending request","x-request-id":"..."}  # prefill step
+```
+
+**Check EPP discovered disaggregated pods:**
+```bash
+kubectl logs deployment/<epp-deployment> -c epp --tail=200 | grep "Before running filter"
+```
+Expected: Endpoints list includes pods with `llm-d.ai/role: encode`, `prefill`, `decode`
+
+### Verify Pod Discovery
+
+```bash
+# Check all inference pods
+kubectl get pods -l llm-d.ai/inferenceServing=true -o wide
+
+# Check disaggregated pods specifically
+kubectl get pods -l llm-d.ai/role --show-labels
+```
+
+Expected output:
+```
+NAME                                    READY   STATUS    LABELS
+llm-encode-vllm-sim-...                 2/2     Running   llm-d.ai/role=encode,...
+llm-prefill-vllm-sim-...                2/2     Running   llm-d.ai/role=prefill,...
+llm-decode-vllm-sim-...                 2/2     Running   llm-d.ai/role=decode,...
 ```
 
 ## Configuration Details
 
 ### Gateway Address
 
-**Critical:** The coordinator must point to the Envoy Gateway, not directly to EPP.
+**Critical:** The coordinator must point to Envoy Gateway, not directly to EPP.
 
 - ✅ Correct: `http://inference-gateway-istio.default.svc.cluster.local`
-- ❌ Wrong: `http://epp-service:9002` (EPP expects gRPC ext-proc from Envoy, not HTTP)
+- ❌ Wrong: `http://epp-service:9002` (EPP expects gRPC ext-proc from Envoy)
 
-### Pipeline Step
+### EPP Phase Filtering
 
-The `gateway-proxy` step:
-- Accepts the request
-- Forwards to Envoy Gateway via HTTP
-- Envoy calls EPP via gRPC ext-proc
-- EPP's modality filter selects the correct backend pod
-- Response streams back through the chain
+**Current Status:** EPP's `decode-filter` plugin does NOT filter by `EPP-Phase` header or `llm-d.ai/role` label yet.
 
-This is simpler than the full disaggregation pipeline:
-- Full LLM: `replace-media-urls → render → encode → prefill → decode`
-- Multimodal: `gateway-proxy` (single step)
+**What works:**
+- ✅ Coordinator sets correct `EPP-Phase` headers
+- ✅ EPP discovers all pods with `llm-d.ai/role` labels
+- ✅ Full request chain: Coordinator → Envoy → EPP → Backend
 
-## Troubleshooting
+**What needs configuration:**
+- ⚠️ EPP needs phase-aware filtering (use `disagg-profile-handler` or configure `decode-filter`)
+- Currently EPP returns all autoregressive-llm pods regardless of role
 
-### 404 Not Found
+**To enable phase-based routing in EPP:**
 
-If the coordinator returns 404 for multimodal endpoints:
-
-1. Verify routes are registered in `pkg/server/server.go`
-2. Check coordinator logs for route registration
-3. Rebuild and reload the image
-
-### Timeout Errors
-
-If you see `dial tcp: i/o timeout`:
-
-1. Verify Envoy Gateway service exists:
-   ```bash
-   kubectl get svc inference-gateway-istio
-   ```
-
-2. Check coordinator config points to correct gateway address
-
-3. Verify network policies allow coordinator → gateway traffic
-
-### Configuration Not Loading
-
-If the coordinator uses default config instead of your ConfigMap:
-
-1. Verify the pod has `--config` argument:
-   ```bash
-   kubectl get deployment coordinator -o yaml | grep -A3 args
-   ```
-
-2. Expected: `args: ["--config=/etc/coordinator/coordinator.yaml"]`
-
-3. If missing, add to deployment spec and reapply
-
-## Updating After Code Changes
-
-```bash
-# 1. Rebuild the image
-TARGETARCH=arm64 make image-build-coordinator
-
-# 2. Reload into kind (if using kind)
-kind --name <cluster-name> load docker-image ghcr.io/llm-d/llm-d-coordinator:dev
-
-# 3. Restart the deployment
-kubectl rollout restart deployment/coordinator
-kubectl rollout status deployment/coordinator
+Option 1 - Use disagg-profile-handler:
+```yaml
+# epp-config.yaml
+plugins:
+  - type: disagg-profile-handler  # Instead of single-profile-handler
+    parameters:
+      # Configure prefill-profile and decode-profile
 ```
+
+Option 2 - Configure decode-filter to check EPP-Phase header + llm-d.ai/role label (requires EPP code changes or plugin configuration)
 
 ## How EPP Routing Works
 
-The modality filter in EPP routes based on:
+### Modality Filter
 
-1. **Request path** → maps to compatible model architectures
-2. **Pod labels** → filters pods by `llm-d.ai/model-arch`
-
-**Mapping:**
+Routes based on endpoint path → compatible model architectures:
 
 | Endpoint Path | Compatible Architectures |
 |---------------|-------------------------|
@@ -426,75 +378,78 @@ The modality filter in EPP routes based on:
 | `/v1/images/generations` | `diffusion` |
 | `/v1/chat/completions` | `autoregressive-llm`, `omni-llm` |
 
-**Example flow for `/v1/audio/speech`:**
+### Phase Filter (Future)
 
-1. Coordinator receives request
-2. Gateway-proxy forwards to Envoy
-3. Envoy calls EPP via ext-proc
-4. EPP modality filter:
-   - Sees path `/v1/audio/speech`
-   - Filters to pods with label `llm-d.ai/model-arch: autoregressive-tts`
-5. EPP returns selected pod to Envoy
-6. Envoy forwards request to TTS backend pod
+When configured with disagg-profile-handler, will route based on:
+- `EPP-Phase` header (`encode`, `prefill`, `decode`)
+- `llm-d.ai/role` label on pods
 
-## Future Enhancements
+## Troubleshooting
 
-### Disaggregated Multimodal
+### 404 Not Found from Backend
 
-For more complex multimodal workloads, you could create full disaggregation pipelines:
+**Symptom:** Request reaches backend but returns 404
 
-```yaml
-# Future: TTS disaggregation
-tts:
-  endpoints: ["/v1/audio/speech"]
-  steps:
-    - type: text-encode      # Separate text encoder pod
-    - type: acoustic-model   # Separate acoustic model pod
-    - type: vocoder          # Separate vocoder pod (streaming)
+**Cause:** vllm-sim is a mock that doesn't implement all endpoints
+
+**Solution:** This is expected behavior for testing. Real vLLM backends will handle these endpoints.
+
+### Coordinator Returns 404
+
+**Symptom:** Coordinator itself returns 404
+
+**Cause:** Routes not registered in server.go
+
+**Fix:** Verify multimodal routes are registered (see section 3 above)
+
+### EPP Not Discovering Pods
+
+**Symptom:** EPP logs show "Pod removed or not added"
+
+**Causes:**
+1. Missing vllm container (only routing-sidecar deployed)
+2. Wrong app label (must be `food-review-inference-pool`)
+3. vllm container returning 503 on health checks
+
+**Fix:** Ensure both containers are running and healthy:
+```bash
+kubectl get pods -l llm-d.ai/role
+# Should show 2/2 READY
+
+kubectl logs <pod-name> -c vllm --tail=20
+# Should show "Server starting"
 ```
 
-Backend pods would be split by phase:
-- Text encoder pods: `llm-d.ai/phase: text-encode`
-- Acoustic model pods: `llm-d.ai/phase: acoustic`
-- Vocoder pods: `llm-d.ai/phase: vocoder`
+### Timeout Errors
 
-### Multiple Pipelines
+**Symptom:** Requests hang or timeout
 
-The coordinator can support different pipelines per endpoint:
+**Cause:** Gateway address incorrect
 
+**Fix:** Verify coordinator config:
 ```yaml
-pipeline:
-  steps:
-    # Default for all endpoints
-    - type: gateway-proxy
-
-# Or endpoint-specific pipelines (future enhancement):
-pipelines:
-  llm:
-    endpoints: ["/v1/chat/completions"]
-    steps: [replace-media-urls, render, encode, prefill, decode]
-  
-  tts:
-    endpoints: ["/v1/audio/speech"]
-    steps: [gateway-proxy]
+gateway:
+  address: "http://inference-gateway-istio.default.svc.cluster.local"
 ```
 
 ## Summary
 
-The coordinator now provides a unified API entry point for:
-- ✅ LLM requests (chat/completions)
-- ✅ TTS requests (audio/speech)
-- ✅ STT requests (audio/transcriptions)
-- ✅ Image generation requests (images/generations)
+**Multimodal Integration:**
+- ✅ 1 new pipeline step (`gateway-proxy`)
+- ✅ 3 new path constants
+- ✅ 3 new route registrations
+- ✅ EPP modality-filter working
 
-All requests benefit from EPP's intelligent routing based on:
-- Request path analysis
-- Pod label filtering (`llm-d.ai/model-arch`)
+**Disaggregated LLM Integration:**
+- ✅ Using existing encode/prefill/decode steps
+- ✅ EPP-Phase headers set correctly
+- ✅ 3 separate backend pods with role labels deployed
+- ✅ EPP discovers all disaggregated pods
+- ⚠️ EPP phase-based filtering needs configuration (disagg-profile-handler)
+
+The coordinator provides a unified API entry point for all inference types while EPP handles intelligent routing based on:
+- Request path analysis (modality filter)
+- Pod label filtering (`llm-d.ai/model-arch`, `llm-d.ai/role`)
 - Real-time scoring (queue depth, KV cache utilization)
 
-The integration is minimal and non-invasive:
-- 1 new pipeline step (`gateway-proxy`)
-- 3 new path constants
-- 3 new route registrations
-
-No changes to existing LLM pipeline logic!
+No changes to existing LLM pipeline logic were needed!
