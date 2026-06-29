@@ -92,6 +92,9 @@ func New(cfg config.ServerConfig, p *pipeline.Pipeline) *Server {
 
 	r.Post(gateway.PathChatCompletions, s.handleInference)
 	r.Post(gateway.PathCompletions, s.handleInference)
+	r.Post(gateway.PathAudioSpeech, s.handleInference)
+	r.Post(gateway.PathAudioTranscriptions, s.handleInference)
+	r.Post(gateway.PathImagesGenerations, s.handleInference)
 	r.Get("/healthz", s.handleHealth)
 	r.Get("/readyz", s.handleHealth)
 

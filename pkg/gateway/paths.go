@@ -19,9 +19,12 @@ package gateway
 import "strings"
 
 const (
-	PathChatCompletions = "/v1/chat/completions"
-	PathCompletions     = "/v1/completions"
-	DefaultGeneratePath = "/inference/v1/generate"
+	PathChatCompletions      = "/v1/chat/completions"
+	PathCompletions          = "/v1/completions"
+	PathAudioSpeech          = "/v1/audio/speech"
+	PathAudioTranscriptions  = "/v1/audio/transcriptions"
+	PathImagesGenerations    = "/v1/images/generations"
+	DefaultGeneratePath      = "/inference/v1/generate"
 
 	EPPPhaseHeader    = "EPP-Phase"
 	ContentTypeHeader = "Content-Type"
