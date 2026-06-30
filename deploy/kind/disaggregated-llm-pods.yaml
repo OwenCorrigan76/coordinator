@@ -1,0 +1,182 @@
+---
+# Encode Pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-encode-vllm-sim
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: food-review-inference-pool
+      workload-type: llm-encode
+  template:
+    metadata:
+      labels:
+        app: food-review-inference-pool
+        workload-type: llm-encode
+        llm-d.ai/inferenceServing: "true"
+        llm-d.ai/model-arch: autoregressive-llm
+        llm-d.ai/role: encode
+    spec:
+      containers:
+      - name: routing-sidecar
+        image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8000
+        - --vllm-port=8200
+        - --kv-connector=nixlv2
+        - --secure-proxy=false
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8000
+          name: sidecar-http
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      - name: vllm
+        image: ghcr.io/llm-d/llm-d-inference-sim:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8200
+        - --model=llama-3-encode
+        - --enable-kvcache=false
+        - --kv-cache-size=1024
+        - --block-size=16
+        - --zmq-endpoint=tcp://food-review-endpoint-picker.default.svc.cluster.local:5557
+        - --event-batch-size=16
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8200
+          name: http
+        env:
+        - name: PORT
+          value: "8200"
+        - name: PYTHONHASHSEED
+          value: "42"
+
+---
+# Prefill Pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-prefill-vllm-sim
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: food-review-inference-pool
+      workload-type: llm-prefill
+  template:
+    metadata:
+      labels:
+        app: food-review-inference-pool
+        workload-type: llm-prefill
+        llm-d.ai/inferenceServing: "true"
+        llm-d.ai/model-arch: autoregressive-llm
+        llm-d.ai/role: prefill
+    spec:
+      containers:
+      - name: routing-sidecar
+        image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8000
+        - --vllm-port=8200
+        - --kv-connector=nixlv2
+        - --secure-proxy=false
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8000
+          name: sidecar-http
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      - name: vllm
+        image: ghcr.io/llm-d/llm-d-inference-sim:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8200
+        - --model=llama-3-prefill
+        - --enable-kvcache=false
+        - --kv-cache-size=1024
+        - --block-size=16
+        - --zmq-endpoint=tcp://food-review-endpoint-picker.default.svc.cluster.local:5557
+        - --event-batch-size=16
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8200
+          name: http
+        env:
+        - name: PORT
+          value: "8200"
+        - name: PYTHONHASHSEED
+          value: "42"
+
+---
+# Decode Pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-decode-vllm-sim
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: food-review-inference-pool
+      workload-type: llm-decode
+  template:
+    metadata:
+      labels:
+        app: food-review-inference-pool
+        workload-type: llm-decode
+        llm-d.ai/inferenceServing: "true"
+        llm-d.ai/model-arch: autoregressive-llm
+        llm-d.ai/role: decode
+    spec:
+      containers:
+      - name: routing-sidecar
+        image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8000
+        - --vllm-port=8200
+        - --kv-connector=nixlv2
+        - --secure-proxy=false
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8000
+          name: sidecar-http
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      - name: vllm
+        image: ghcr.io/llm-d/llm-d-inference-sim:latest
+        imagePullPolicy: IfNotPresent
+        args:
+        - --port=8200
+        - --model=llama-3-decode
+        - --enable-kvcache=false
+        - --kv-cache-size=1024
+        - --block-size=16
+        - --zmq-endpoint=tcp://food-review-endpoint-picker.default.svc.cluster.local:5557
+        - --event-batch-size=16
+        - --data-parallel-size=1
+        ports:
+        - containerPort: 8200
+          name: http
+        env:
+        - name: PORT
+          value: "8200"
+        - name: PYTHONHASHSEED
+          value: "42"

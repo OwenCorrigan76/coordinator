@@ -170,7 +170,7 @@ The coordinator already had disaggregation steps that set EPP-Phase headers:
 
 Created three separate pod deployments with `llm-d.ai/role` labels for phase-based routing:
 
-**File:** `disaggregated-llm-pods.yaml`
+**File:** `deploy/kind/disaggregated-llm-pods.yaml`
 
 ```yaml
 ---
@@ -212,12 +212,28 @@ spec:
 - `llm-d.ai/role` label: `encode`, `prefill`, or `decode`
 - `llm-d.ai/model-arch: autoregressive-llm` for modality filtering
 
+## Deployment
+
+### Prerequisites
+
+Before deploying the coordinator, ensure the llm-d-router infrastructure is running:
+
+```bash
+# From llm-d-router repository
+cd /path/to/llm-d-router/deploy/kind
+./setup-kind-cluster.sh
+```
+
+This sets up the kind cluster with EPP and backend pods.
+
 ## Pipeline Configurations
 
 ### Multimodal Pipeline (gateway-proxy)
 
+**File:** `deploy/kind/coordinator-deployment.yaml` (ConfigMap section)
+
 ```yaml
-# configs/coordinator-multimodal.yaml
+# Default configuration in coordinator-deployment.yaml
 pipeline:
   kv_connector: kv-shared-storage
   ec_connector: ec-shared-storage
@@ -230,8 +246,10 @@ pipeline:
 
 ### Disaggregated LLM Pipeline (encode → prefill → decode)
 
+**Configuration:** Edit the ConfigMap in `deploy/kind/coordinator-deployment.yaml`
+
 ```yaml
-# configs/coordinator-disaggregated.yaml
+# Modified configuration for disaggregated mode
 pipeline:
   kv_connector: kv-shared-storage
   ec_connector: ec-shared-storage
@@ -244,6 +262,58 @@ pipeline:
       params: {}
     - type: decode
       params: {}
+```
+
+## Building Coordinator Image
+
+Before deploying, build the coordinator image:
+
+```bash
+# From coordinator repository root
+# Build for arm64 (Mac M1/M2)
+TARGETARCH=arm64 make image-build-coordinator
+
+# For amd64 (Intel)
+TARGETARCH=amd64 make image-build-coordinator
+
+# Verify image was built
+docker images | grep coordinator
+```
+
+### Load Image into Kind Cluster
+
+```bash
+kind --name llm-d-inference-scheduler-dev load docker-image ghcr.io/llm-d/llm-d-coordinator:dev
+```
+
+## Deploying Coordinator
+
+### Option 1: Multimodal Gateway-Proxy (Default)
+
+```bash
+cd deploy/kind
+kubectl apply -f coordinator-deployment.yaml
+kubectl wait --for=condition=available deployment/coordinator --timeout=60s
+```
+
+### Option 2: Disaggregated LLM Pipeline
+
+```bash
+cd deploy/kind
+
+# Deploy disaggregated pods
+kubectl apply -f disaggregated-llm-pods.yaml
+kubectl wait --for=condition=ready pod -l llm-d.ai/role --timeout=120s
+
+# Edit coordinator-deployment.yaml ConfigMap to use:
+#   steps:
+#     - type: encode
+#     - type: prefill  
+#     - type: decode
+
+# Deploy coordinator
+kubectl apply -f coordinator-deployment.yaml
+kubectl wait --for=condition=available deployment/coordinator --timeout=60s
 ```
 
 ## Testing
@@ -430,6 +500,69 @@ kubectl logs <pod-name> -c vllm --tail=20
 ```yaml
 gateway:
   address: "http://inference-gateway-istio.default.svc.cluster.local"
+```
+
+## Repository Structure
+
+```
+coordinator/
+├── pkg/                           # Source code
+│   ├── steps/                     # Pipeline steps
+│   │   ├── gateway_proxy.go       # NEW: Simple proxy step
+│   │   ├── encode.go              # Sets EPP-Phase: encode
+│   │   ├── prefill.go             # Sets EPP-Phase: prefill
+│   │   └── decode.go              # Sets EPP-Phase: decode
+│   ├── gateway/                   
+│   │   └── paths.go               # NEW: Multimodal path constants
+│   └── server/
+│       └── server.go              # NEW: Multimodal route registration
+├── deploy/
+│   └── kind/                      # Kind deployment files
+│       ├── README.md              # Quick start guide
+│       ├── coordinator-deployment.yaml
+│       └── disaggregated-llm-pods.yaml
+└── MULTIMODAL-INTEGRATION.md     # This file
+```
+
+## Complete Deployment Workflow
+
+### 1. Deploy llm-d-router Infrastructure (Required First)
+
+From the [llm-d-router repository](https://github.com/rh-waterford-et/llm-d-router):
+
+```bash
+cd /path/to/llm-d-router/deploy/kind
+./setup-kind-cluster.sh
+```
+
+This creates the kind cluster with EPP and backend pods.
+
+### 2. Build and Deploy Coordinator
+
+From this repository:
+
+```bash
+# Build image
+TARGETARCH=arm64 make image-build-coordinator
+
+# Load into kind
+kind --name llm-d-inference-scheduler-dev load docker-image ghcr.io/llm-d/llm-d-coordinator:dev
+
+# Deploy
+cd deploy/kind
+kubectl apply -f coordinator-deployment.yaml
+
+# Optional: Deploy disaggregated pods
+kubectl apply -f disaggregated-llm-pods.yaml
+```
+
+### 3. Test
+
+```bash
+kubectl port-forward svc/coordinator 8080:80 &
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","input":"test"}'
 ```
 
 ## Summary

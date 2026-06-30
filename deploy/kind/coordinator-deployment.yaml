@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coordinator-config
+  namespace: default
+data:
+  coordinator.yaml: |
+    log_level: 2
+
+    server:
+      listen_addr: ":8080"
+      read_timeout: 30s
+      write_timeout: 120s
+      shutdown_timeout: 25s
+
+    gateway:
+      address: "http://inference-gateway-istio.default.svc.cluster.local"
+      max_idle_conns_per_host: 100
+      idle_conn_timeout: 90s
+      timeout: 60s
+
+    pipeline:
+      kv_connector: kv-shared-storage
+      ec_connector: ec-shared-storage
+      use_openai_format: true
+
+      steps:
+        - type: encode
+          params: {}
+        - type: prefill
+          params: {}
+        - type: decode
+          params: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: default
+  labels:
+    app: coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coordinator
+  template:
+    metadata:
+      labels:
+        app: coordinator
+    spec:
+      containers:
+      - name: coordinator
+        image: ghcr.io/llm-d/llm-d-coordinator:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --config=/etc/coordinator/coordinator.yaml
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/coordinator
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: coordinator-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: default
+spec:
+  selector:
+    app: coordinator
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP
