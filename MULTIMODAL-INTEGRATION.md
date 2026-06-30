@@ -216,15 +216,33 @@ spec:
 
 ### Prerequisites
 
-Before deploying the coordinator, ensure the llm-d-router infrastructure is running:
+**1. Build llm-d-router images:**
+```bash
+# From llm-d-router repository root
+make docker-build-epp
+make docker-build-sidecar
+```
 
+**2. Deploy llm-d-router infrastructure:**
 ```bash
 # From llm-d-router repository
-cd /path/to/llm-d-router/deploy/kind
+cd deploy/kind
 ./setup-kind-cluster.sh
 ```
 
-This sets up the kind cluster with EPP and backend pods.
+This script will:
+- Create the kind cluster
+- Load required Docker images (auto-pulls vllm-sim)
+- Deploy CRDs (InferencePool, InferenceObjective)
+- Deploy EPP and Envoy Gateway
+- Deploy backend pods (TTS, STT, Image, LLM)
+- Wait for all components to be ready
+
+Verify deployment:
+```bash
+kubectl get pods
+# All pods should be Running
+```
 
 ## Pipeline Configurations
 
@@ -531,11 +549,29 @@ coordinator/
 From the [llm-d-router repository](https://github.com/rh-waterford-et/llm-d-router):
 
 ```bash
-cd /path/to/llm-d-router/deploy/kind
+# Build required images
+make docker-build-epp
+make docker-build-sidecar
+
+# Deploy infrastructure
+cd deploy/kind
 ./setup-kind-cluster.sh
 ```
 
-This creates the kind cluster with EPP and backend pods.
+The setup script will:
+- Create kind cluster `llm-d-inference-scheduler-dev`
+- Load Docker images (auto-pulls vllm-sim:v0.8.2)
+- Deploy CRDs, EPP, Envoy Gateway, and backend pods
+- Wait for all components to be ready
+
+Verify:
+```bash
+kubectl get pods
+# Expected: All pods Running
+# - food-review-endpoint-picker (1/1)
+# - inference-gateway-istio (1/1)
+# - 4 backend pods (2/2 each: TTS, STT, Image, LLM)
+```
 
 ### 2. Build and Deploy Coordinator
 

@@ -4,14 +4,33 @@ This directory contains the deployment files for testing the coordinator with mu
 
 ## Prerequisites
 
-You must first set up the llm-d-router infrastructure:
+**1. Build llm-d-router images:**
+
+From llm-d-router repository root:
+```bash
+make docker-build-epp
+make docker-build-sidecar
+```
+
+**2. Deploy llm-d-router infrastructure:**
 
 ```bash
 cd /path/to/llm-d-router/deploy/kind
 ./setup-kind-cluster.sh
 ```
 
-This creates the kind cluster with EPP and backend pods.
+This script will:
+- Create kind cluster `llm-d-inference-scheduler-dev`
+- Load Docker images (EPP, sidecar, vllm-sim)
+- Deploy CRDs, EPP, Envoy Gateway
+- Deploy backend pods (TTS, STT, Image, LLM)
+- Wait for all components to be ready
+
+Verify before proceeding:
+```bash
+kubectl get pods
+# All pods should show Running/Ready
+```
 
 ## Files
 
